@@ -2,7 +2,6 @@
 #include "bbport_overlay.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -17,6 +16,7 @@
 #include <SDL3/SDL.h>
 #include "bbport_guest_hooks.h"
 #include "bbport_frame_rate.h"
+#include "bbport_menu_placement.h"
 #include "bbport_settings.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -56,9 +56,22 @@ namespace {
 std::mutex imgui_mutex; // the ImGui context: window thread (input) and present thread
 bool initialized = false;
 std::atomic<bool> menu_open{false};
+// Closing the game from the menu (issues #74, #116): the first press arms it, a second press
+// within a few seconds confirms.
+std::atomic<bool> quit_armed{false};
+std::chrono::steady_clock::time_point quit_armed_at;
 bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
 float base_scale = 1.0f;
+
+// BB_MENU_DEBUG=1: the menu's place and size on stdout (reports of a menu cut off at the edge).
+bool MenuDebug() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_MENU_DEBUG");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
 // The game's text dialog (ImeDialog, the character name), typed on the keyboard: drawn while it
 // is open. In fullscreen the window title that showed it is not visible (issues #17, #19).
 std::mutex prompt_mutex;
@@ -93,6 +106,9 @@ void SetOpen(bool value) {
     if (!value && dirty) {
         dirty = false;
         BbSettings::Save();
+    }
+    if (!value) {
+        quit_armed = false;
     }
 }
 
@@ -364,17 +380,17 @@ void ToyPadSection() {
 void Menu() {
     auto& s = BbSettings::Get();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    // Where it was moved last (bbport.ini menu_pos, a fraction of the screen), kept on screen.
-    ImVec2 pos(viewport->WorkPos.x + 40.0f * base_scale, viewport->WorkPos.y + 40.0f * base_scale);
-    if (s.menu_x >= 0.0f && s.menu_y >= 0.0f) {
-        const float margin = 80.0f * base_scale;
-        pos.x = viewport->WorkPos.x +
-                std::clamp(s.menu_x * viewport->WorkSize.x, 0.0f, std::max(viewport->WorkSize.x - margin, 0.0f));
-        pos.y = viewport->WorkPos.y +
-                std::clamp(s.menu_y * viewport->WorkSize.y, 0.0f, std::max(viewport->WorkSize.y - margin, 0.0f));
-    }
-    ImGui::SetNextWindowPos(pos, ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(620.0f * base_scale, 0.0f), ImGuiCond_Appearing);
+    // Kept on screen and tall only up to the room below its place (bbport_menu_placement.h): at
+    // 1080p the content is taller than the screen, and a window that grew to the screen's height
+    // at y=40 left its last rows (Close, Quit) 34 px below the edge, out of reach even at the
+    // end of the scroll.
+    const MenuFrame frame = PlaceMenu(viewport->WorkPos.x, viewport->WorkPos.y,
+                                      viewport->WorkSize.x, viewport->WorkSize.y, s.menu_x,
+                                      s.menu_y, base_scale);
+    ImGui::SetNextWindowPos(ImVec2(frame.x, frame.y), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(frame.width, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(frame.width, 0.0f),
+                                        ImVec2(frame.width, std::max(frame.height, 1.0f)));
     bool keep_open = true;
     if (!ImGui::Begin(
             BbSettings::MenuText("Bloodborne - Graphics  (Insert / L3+R3)###bbport_settings",
@@ -388,7 +404,7 @@ void Menu() {
         const ImVec2 at = ImGui::GetWindowPos();
         const float fx = (at.x - viewport->WorkPos.x) / viewport->WorkSize.x;
         const float fy = (at.y - viewport->WorkPos.y) / viewport->WorkSize.y;
-        if (std::abs(at.x - pos.x) >= 1.0f || std::abs(at.y - pos.y) >= 1.0f) {
+        if (std::abs(at.x - frame.x) >= 1.0f || std::abs(at.y - frame.y) >= 1.0f) {
             s.menu_x = fx;
             s.menu_y = fy;
             dirty = true;
@@ -824,23 +840,48 @@ void Menu() {
         keep_open = false;
     }
     // Issues #74, #116: leaving the game from the pad (this menu opens with L3+R3). A second
-    // press confirms; the window thread then closes like the window's own close button.
-    static bool quit_armed;
+    // press within a few seconds confirms; the window thread then closes like the window's own
+    // close button. Focus and hover are not checked: they used to disarm the button, but a press
+    // moves ImGui's nav focus, so the second press never saw it armed.
+    const auto now = std::chrono::steady_clock::now();
+    const bool armed = quit_armed && now - quit_armed_at < std::chrono::seconds(6);
+    // The label changes between the two presses, so the widget ID is pinned with ###quit:
+    // ImGui derives it from the label, and a new ID loses the nav focus (and with it the second
+    // press) on the next frame.
     ImGui::SameLine();
-    if (ImGui::Button(quit_armed ? BbSettings::MenuText("Press again to quit", "Нажмите ещё раз для выхода")
-                                 : BbSettings::MenuText("Quit game", "Выйти из игры"))) {
-        if (quit_armed) {
+    if (ImGui::Button(armed ? BbSettings::MenuText("Press again to quit###quit",
+                                                  "Нажмите ещё раз для выхода###quit")
+                             : BbSettings::MenuText("Quit game###quit", "Выйти из игры###quit"))) {
+        if (armed) {
             SDL_Event quit{};
             quit.type = SDL_EVENT_QUIT;
-            SDL_PushEvent(&quit);
+            if (!SDL_PushEvent(&quit)) {
+                std::printf("Overlay: the quit event was not delivered: %s\n", SDL_GetError());
+            }
         }
-        quit_armed = !quit_armed;
-    }
-    if (quit_armed && !ImGui::IsItemFocused() && !ImGui::IsItemHovered()) {
-        quit_armed = false;
+        quit_armed = !armed;
+        quit_armed_at = now;
     }
     ImGui::TextDisabled("%s", BbSettings::MenuText("Settings are saved to bbport.ini",
                                              "Настройки сохраняются в bbport.ini"));
+    if (MenuDebug()) {
+        static ImVec2 last_size{-1.0f, -1.0f};
+        static float last_scroll = -1.0f, last_y = -1.0f;
+        const ImVec2 at = ImGui::GetWindowPos();
+        const ImVec2 size = ImGui::GetWindowSize();
+        const float scroll = ImGui::GetScrollMaxY();
+        const float y = ImGui::GetScrollY();
+        if (std::abs(size.x - last_size.x) >= 1.0f || std::abs(size.y - last_size.y) >= 1.0f ||
+            std::abs(scroll - last_scroll) >= 1.0f || std::abs(y - last_y) >= 1.0f) {
+            last_size = size;
+            last_scroll = scroll;
+            last_y = y;
+            std::printf("Overlay: menu at %.0f,%.0f size %.0fx%.0f, screen %.0fx%.0f, "
+                        "scroll max %.0f (at %.0f)\n",
+                        at.x, at.y, size.x, size.y, viewport->WorkSize.x, viewport->WorkSize.y,
+                        scroll, y);
+        }
+    }
     ImGui::End();
     if (!keep_open) {
         SetOpen(false);
